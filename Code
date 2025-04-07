@@ -1,0 +1,17 @@
+public class Main {
+    public static void main(String[] args) {
+        // Download file from SFTP server
+        boolean downloaded = SFTPUtils.copyFromSftp(
+            "sftp.example.com", 22, "username",
+            "/path/to/private_key", "key_passphrase",
+            "/remote/file.txt", "/local/file.txt"
+        );
+
+        // Upload file to SFTP server
+        boolean uploaded = SFTPUtils.moveToSftp(
+            "sftp.example.com", 22, "username",
+            "/path/to/private_key", "key_passphrase",
+            "/local/file.txt", "/remote/file.txt"
+        );
+    }
+}
