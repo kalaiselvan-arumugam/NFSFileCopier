@@ -15,3 +15,47 @@ public class Main {
         );
     }
 }
+
+
+
+private ChannelSftp connect() {
+    try {
+        JSch jsch = new JSch();
+        jsch.setKnownHosts(config.getKnownHosts());
+
+        // Enable debug logging
+        JSch.setLogger(new com.jcraft.jsch.Logger() {
+            public boolean isEnabled(int level) { return true; }
+            public void log(int level, String message) { 
+                System.out.println("JSch DEBUG: " + message); 
+            }
+        });
+
+        // Algorithm configuration
+        java.util.Properties sessionConfig = new java.util.Properties();
+        // Try these in order:
+        sessionConfig.put("kex", "diffie-hellman-group14-sha1," +
+                               "diffie-hellman-group-exchange-sha1," +
+                               "ecdh-sha2-nistp256");
+        sessionConfig.put("server_host_key", "ssh-rsa,ssh-dss,ecdsa-sha2-nistp256");
+        sessionConfig.put("StrictHostKeyChecking", "yes");
+        sessionConfig.put("cipher.s2c", "aes128-ctr,aes128-cbc,3des-ctr,3des-cbc");
+        sessionConfig.put("cipher.c2s", "aes128-ctr,aes128-cbc,3des-ctr,3des-cbc");
+
+        Session session = jsch.getSession(config.getUsername(), config.getHost(), config.getPort());
+        session.setPassword(config.getPassword());
+        session.setConfig(sessionConfig);
+        session.connect(config.getSessionTimeout());
+
+        Channel channel = session.openChannel("sftp");
+        channel.connect(config.getChannelTimeout());
+        return (ChannelSftp) channel;
+    } catch (JSchException e) {
+        System.err.println("SFTP connection failed. Possible causes:");
+        System.err.println("1. Algorithm mismatch (try updating JSch)");
+        System.err.println("2. Server requires different encryption");
+        System.err.println("3. Network/firewall issues");
+        System.err.println("Error details: " + e.getMessage());
+        return null;
+    }
+}
