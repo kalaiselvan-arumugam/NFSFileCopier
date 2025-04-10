@@ -1,0 +1,289 @@
+> Test
+
+``` java
+package com.ks.auth;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.security.test.context.support.WithMockUser;
+import org.springframework.test.web.servlet.MockMvc;
+
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+
+@SpringBootTest
+@AutoConfigureMockMvc
+class TestControllerTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @Test
+    void publicEndpoint_shouldReturnPublicMessage() throws Exception {
+        mockMvc.perform(get("/api/test/public"))
+                .andExpect(status().isOk())
+                .andExpect(content().string("This is a public endpoint - no token required"));
+    }
+
+    @Test
+    @WithMockUser(username = "testClient")
+    void protectedEndpoint_shouldReturnClientId() throws Exception {
+        mockMvc.perform(get("/api/test/protected"))
+                .andExpect(status().isOk())
+                .andExpect(content().string("This is a protected endpoint - your client ID is: testClient"));
+    }
+
+    @Test
+    void protectedEndpoint_withoutAuth_shouldReturnUnauthorized() throws Exception {
+        mockMvc.perform(get("/api/test/protected"))
+                .andExpect(status().isUnauthorized());
+    }
+}
+```
+
+
+``` java
+package com.ks.auth;
+
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.http.MediaType;
+import org.springframework.test.web.servlet.MockMvc;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+
+@SpringBootTest
+@AutoConfigureMockMvc
+class AuthControllerTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @MockBean
+    private AuthService authService;
+
+    @MockBean
+    private JwtUtils jwtUtils;
+
+    @Test
+    void login_withValidCredentials_shouldReturnToken() throws Exception {
+        AuthRequest request = new AuthRequest();
+        request.setClient_id("client1");
+        request.setClient_secret("secret");
+        request.setOrgid("org1");
+        request.setUniqueid("unique1");
+
+        Mockito.when(authService.isValidClient(any(AuthRequest.class))).thenReturn(true);
+        Mockito.when(jwtUtils.generateToken("client1")).thenReturn("testToken");
+        Mockito.when(jwtUtils.getExpiration()).thenReturn(3600);
+
+        mockMvc.perform(post("/api/auth/login")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"client_id\":\"client1\",\"client_secret\":\"secret\",\"orgid\":\"org1\",\"uniqueid\":\"unique1\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.access_token").value("testToken"))
+                .andExpect(jsonPath("$.expires_in").value(3600));
+    }
+
+    @Test
+    void login_withInvalidCredentials_shouldReturnUnauthorized() throws Exception {
+        Mockito.when(authService.isValidClient(any(AuthRequest.class))).thenReturn(false);
+
+        mockMvc.perform(post("/api/auth/login")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"client_id\":\"invalid\",\"client_secret\":\"invalid\"}"))
+                .andExpect(status().isUnauthorized());
+    }
+}
+```
+
+``` java
+package com.ks.auth;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+class AuthServiceTest {
+
+    private final AuthService authService = new AuthService();
+
+    @Test
+    void isValidClient_withCompleteRequest_shouldReturnTrue() {
+        AuthRequest request = new AuthRequest();
+        request.setClient_id("client1");
+        request.setClient_secret("secret");
+        request.setOrgid("org1");
+        request.setUniqueid("unique1");
+
+        assertTrue(authService.isValidClient(request));
+    }
+
+    @Test
+    void isValidClient_withMissingFields_shouldReturnFalse() {
+        AuthRequest request1 = new AuthRequest();
+        request1.setClient_id("client1");
+        // Missing other fields
+        assertFalse(authService.isValidClient(request1));
+
+        AuthRequest request2 = new AuthRequest();
+        // All fields null
+        assertFalse(authService.isValidClient(request2));
+    }
+}
+```
+
+``` java
+package com.ks.auth;
+
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jwts;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.InjectMocks;
+import org.mockito.MockitoAnnotations;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import java.util.Date;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class JwtUtilsTest {
+
+    @InjectMocks
+    private JwtUtils jwtUtils;
+
+    private static final String TEST_SECRET = "testSecretKey123456789012345678901234567890";
+    private static final int TEST_EXPIRATION = 3600;
+
+    @BeforeEach
+    void setUp() {
+        MockitoAnnotations.openMocks(this);
+        ReflectionTestUtils.setField(jwtUtils, "secret", TEST_SECRET);
+        ReflectionTestUtils.setField(jwtUtils, "expiration", TEST_EXPIRATION);
+    }
+
+    @Test
+    void generateToken_shouldReturnValidToken() {
+        String clientId = "testClient";
+        String token = jwtUtils.generateToken(clientId);
+
+        assertNotNull(token);
+        assertFalse(token.isEmpty());
+
+        Claims claims = Jwts.parser()
+                .verifyWith(jwtUtils.getSigningKey())
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+
+        assertEquals(clientId, claims.getSubject());
+        assertNotNull(claims.getIssuedAt());
+        assertNotNull(claims.getExpiration());
+    }
+
+    @Test
+    void validateToken_withValidToken_shouldReturnTrue() {
+        String token = jwtUtils.generateToken("testClient");
+        assertTrue(jwtUtils.validateToken(token));
+    }
+
+    @Test
+    void validateToken_withInvalidToken_shouldReturnFalse() {
+        assertFalse(jwtUtils.validateToken("invalid.token.here"));
+    }
+
+    @Test
+    void getClientIdFromToken_shouldReturnCorrectClientId() {
+        String clientId = "testClient123";
+        String token = jwtUtils.generateToken(clientId);
+        assertEquals(clientId, jwtUtils.getClientIdFromToken(token));
+    }
+}
+```
+``` java
+package com.ks.auth;
+
+import org.junit.jupiter.api.Test;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.Mockito;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.security.core.context.SecurityContextHolder;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import java.io.IOException;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.anyString;
+
+@SpringBootTest
+class JwtAuthFilterTest {
+
+    @Mock
+    private JwtUtils jwtUtils;
+
+    @Mock
+    private FilterChain filterChain;
+
+    @InjectMocks
+    private JwtAuthFilter jwtAuthFilter;
+
+    @Test
+    void doFilterInternal_withValidToken_shouldSetAuthentication() throws ServletException, IOException {
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        request.addHeader("Authorization", "Bearer validToken");
+
+        Mockito.when(jwtUtils.validateToken("validToken")).thenReturn(true);
+        Mockito.when(jwtUtils.getClientIdFromToken("validToken")).thenReturn("testClient");
+
+        jwtAuthFilter.doFilterInternal(request, response, filterChain);
+
+        assertNotNull(SecurityContextHolder.getContext().getAuthentication());
+        assertEquals("testClient", SecurityContextHolder.getContext().getAuthentication().getName());
+    }
+
+    @Test
+    void doFilterInternal_withInvalidToken_shouldReturnUnauthorized() throws ServletException, IOException {
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        request.addHeader("Authorization", "Bearer invalidToken");
+
+        Mockito.when(jwtUtils.validateToken("invalidToken")).thenReturn(false);
+
+        jwtAuthFilter.doFilterInternal(request, response, filterChain);
+
+        assertEquals(401, response.getStatus());
+        assertNull(SecurityContextHolder.getContext().getAuthentication());
+    }
+}
+```
+
+``` xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-test</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.junit.jupiter</groupId>
+    <artifactId>junit-jupiter-api</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.mockito</groupId>
+    <artifactId>mockito-core</artifactId>
+    <scope>test</scope>
+</dependency>
+```
