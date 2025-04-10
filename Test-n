@@ -1,0 +1,172 @@
+package com.ks.filebridge.service;
+
+import com.ks.filebridge.domain.AuthRequest;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class AuthServiceTest {
+
+    private final AuthService authService = new AuthService();
+
+    @Test
+    void testValidClient_allFieldsPresent_shouldReturnTrue() {
+        AuthRequest request = new AuthRequest();
+        request.setClient_id("client1");
+        request.setClient_secret("secret");
+        request.setOrgid("org123");
+        request.setUniqueid("uid-456");
+
+        assertTrue(authService.isValidClient(request));
+    }
+
+    @Test
+    void testValidClient_missingClientId_shouldReturnFalse() {
+        AuthRequest request = new AuthRequest();
+        request.setClient_secret("secret");
+        request.setOrgid("org123");
+        request.setUniqueid("uid-456");
+
+        assertFalse(authService.isValidClient(request));
+    }
+
+    @Test
+    void testValidClient_allFieldsNull_shouldReturnFalse() {
+        AuthRequest request = new AuthRequest();
+        assertFalse(authService.isValidClient(request));
+    }
+}
+
+
+package com.ks.filebridge.controller;
+
+import com.ks.filebridge.domain.AuthRequest;
+import com.ks.filebridge.domain.AuthResponse;
+import com.ks.filebridge.service.AuthService;
+import com.ks.filebridge.util.JwtUtils;
+import org.junit.jupiter.api.Test;
+import org.springframework.http.MediaType;
+import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.beans.factory.annotation.Autowired;
+
+import static org.mockito.Mockito.*;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+@WebMvcTest(AuthController.class)
+class AuthControllerTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @MockBean
+    private AuthService authService;
+
+    @MockBean
+    private JwtUtils jwtUtils;
+
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    @Test
+    void testLogin_validClient_shouldReturnToken() throws Exception {
+        AuthRequest request = new AuthRequest();
+        request.setClient_id("client");
+        request.setClient_secret("secret");
+        request.setOrgid("org");
+        request.setUniqueid("uid");
+
+        when(authService.isValidClient(any())).thenReturn(true);
+        when(jwtUtils.generateToken("client")).thenReturn("mock-jwt");
+
+        mockMvc.perform(post("/api/auth/login")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(mapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.token").value("mock-jwt"));
+    }
+
+    @Test
+    void testLogin_invalidClient_shouldReturn401() throws Exception {
+        AuthRequest request = new AuthRequest();
+
+        when(authService.isValidClient(any())).thenReturn(false);
+
+        mockMvc.perform(post("/api/auth/login")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(mapper.writeValueAsString(request)))
+                .andExpect(status().isUnauthorized());
+    }
+}
+
+
+package com.ks.filebridge.controller;
+
+import com.ks.filebridge.service.SftpService;
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.beans.factory.annotation.Autowired;
+
+import static org.mockito.Mockito.*;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+
+@WebMvcTest(SFTPController.class)
+class SFTPControllerTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @MockBean
+    private SftpService sftpService;
+
+    @Test
+    void testCopyFromSftp_shouldReturnSuccess() throws Exception {
+        mockMvc.perform(get("/sftp/copy")
+                .param("fileIdentifier", "testfile.txt"))
+                .andExpect(status().isOk())
+                .andExpect(content().string("success"));
+
+        verify(sftpService).copyFromSftp("/testfile.txt");
+    }
+}
+
+
+<plugin>
+    <groupId>org.jacoco</groupId>
+    <artifactId>jacoco-maven-plugin</artifactId>
+    <version>0.8.10</version>
+    <executions>
+        <execution>
+            <goals>
+                <goal>prepare-agent</goal>
+            </goals>
+        </execution>
+        <execution>
+            <id>report</id>
+            <phase>prepare-package</phase>
+            <goals>
+                <goal>report</goal>
+            </goals>
+        </execution>
+    </executions>
+</plugin>
+
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-test</artifactId>
+    <scope>test</scope>
+</dependency>
+
+
+<dependency>
+    <groupId>com.fasterxml.jackson.core</groupId>
+    <artifactId>jackson-databind</artifactId>
+</dependency>
+
+
