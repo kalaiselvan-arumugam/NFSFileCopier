@@ -1,0 +1,431 @@
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.regex.Pattern;
+
+@RestController
+@RequestMapping("/api/csv")
+public class CsvComparisonController {
+
+    private static final Pattern CSV_SPLIT_PATTERN = Pattern.compile(",");
+    private static final double DEFAULT_THRESHOLD = 5.0;
+    private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
+    private static final String OLD_FILE_PATH = "data/old_file.csv";
+    private static final String UPLOAD_DIR = "uploads";
+
+    static {
+        // Create directories if they don't exist
+        new File(UPLOAD_DIR).mkdirs();
+        new File("data").mkdirs();
+    }
+
+    @PostMapping("/compare")
+    public ResponseEntity<?> compareWithExisting(
+            @RequestParam("newFile") MultipartFile newFile) {
+
+        long startTime = System.currentTimeMillis();
+        Map<String, Object> response = new LinkedHashMap<>();
+
+        try {
+            // Validate new file
+            if (newFile.isEmpty()) {
+                response.put("error", "Please upload a file");
+                return ResponseEntity.badRequest().body(response);
+            }
+
+            if (!newFile.getOriginalFilename().toLowerCase().endsWith(".csv")) {
+                response.put("error", "Only CSV files are allowed");
+                return ResponseEntity.badRequest().body(response);
+            }
+
+            // Check old file exists
+            Path oldFilePath = Paths.get(OLD_FILE_PATH);
+            if (!Files.exists(oldFilePath)) {
+                response.put("error", "Reference file not found at " + OLD_FILE_PATH);
+                return ResponseEntity.badRequest().body(response);
+            }
+
+            // Read headers
+            List<String> oldHeader = readHeader(oldFilePath.toFile());
+            List<String> newHeader = readHeader(newFile);
+
+            // Validate headers
+            if (!oldHeader.equals(newHeader)) {
+                response.put("error", "CSV headers do not match the reference file");
+                return ResponseEntity.badRequest().body(response);
+            }
+
+            int totalColumns = oldHeader.size();
+            if (totalColumns < 2) {
+                response.put("error", "CSV must have at least 2 columns for composite key");
+                return ResponseEntity.badRequest().body(response);
+            }
+
+            // Read data
+            Map<CompositeKey, String[]> oldRecords = readCsvFile(oldFilePath.toFile(), totalColumns);
+            Map<CompositeKey, String[]> newRecords = readCsvFile(newFile, totalColumns);
+
+            // Find common records
+            Set<CompositeKey> commonKeys = new HashSet<>(oldRecords.keySet());
+            commonKeys.retainAll(newRecords.keySet());
+            int overlappingCount = commonKeys.size();
+
+            if (overlappingCount == 0) {
+                response.put("result", "No overlapping records found");
+                return ResponseEntity.ok(response);
+            }
+
+            // Initialize stats
+            ColumnStats[] columnStats = new ColumnStats[totalColumns];
+            for (int i = 0; i < totalColumns; i++) {
+                columnStats[i] = new ColumnStats();
+                columnStats[i].threshold = getThresholdForColumn(i, oldHeader.get(i));
+            }
+
+            // Compare records
+            for (CompositeKey key : commonKeys) {
+                String[] oldValues = oldRecords.get(key);
+                String[] newValues = newRecords.get(key);
+
+                for (int colIdx = 2; colIdx < totalColumns; colIdx++) {
+                    if (!Objects.equals(oldValues[colIdx - 2], newValues[colIdx - 2])) {
+                        columnStats[colIdx].mismatchCount++;
+                        if (columnStats[colIdx].examples.size() < 5) {
+                            columnStats[colIdx].examples.add(new ValuePair<>(
+                                oldValues[colIdx - 2], 
+                                newValues[colIdx - 2]));
+                        }
+                    }
+                }
+            }
+
+            // Prepare results
+            List<Map<String, Object>> columnResults = new ArrayList<>();
+            boolean hasViolations = false;
+            List<Map<String, Object>> violations = new ArrayList<>();
+
+            for (int colIdx = 0; colIdx < totalColumns; colIdx++) {
+                ColumnStats stats = columnStats[colIdx];
+                double changePercent = (stats.mismatchCount * 100.0) / overlappingCount;
+                
+                Map<String, Object> columnData = new LinkedHashMap<>();
+                columnData.put("column", oldHeader.get(colIdx));
+                columnData.put("changed_records", stats.mismatchCount);
+                columnData.put("change_percent", changePercent);
+                columnData.put("threshold", stats.threshold);
+                columnData.put("violation", changePercent > stats.threshold);
+                
+                columnResults.add(columnData);
+
+                if (changePercent > stats.threshold) {
+                    hasViolations = true;
+                    Map<String, Object> violation = new LinkedHashMap<>(columnData);
+                    violation.put("examples", stats.examples.stream()
+                        .map(e -> Map.of(
+                            "old_value", truncate(e.getOldValue(), 50),
+                            "new_value", truncate(e.getNewValue(), 50)
+                        ))
+                        .collect(java.util.stream.Collectors.toList()));
+                    violations.add(violation);
+                }
+            }
+
+            response.put("columns", columnResults);
+            response.put("total_records_compared", overlappingCount);
+            response.put("has_violations", hasViolations);
+            
+            if (hasViolations) {
+                response.put("violations", violations);
+                response.put("message", "Validation failed - some columns exceed threshold");
+            } else {
+                // Save file
+                String fileName = newFile.getOriginalFilename();
+                Path filePath = Paths.get(UPLOAD_DIR, fileName);
+                Files.copy(newFile.getInputStream(), filePath, StandardCopyOption.REPLACE_EXISTING);
+                response.put("message", "Validation passed - new file saved successfully");
+                response.put("saved_path", filePath.toString());
+            }
+
+            response.put("processing_time_ms", System.currentTimeMillis() - startTime);
+            return ResponseEntity.ok(response);
+
+        } catch (IOException e) {
+            response.put("error", "File processing error: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(response);
+        }
+    }
+
+    private List<String> readHeader(File file) throws IOException {
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+            String line = reader.readLine();
+            if (line == null) throw new IOException("Empty file: " + file.getName());
+            return Arrays.asList(CSV_SPLIT_PATTERN.split(line, -1));
+        }
+    }
+
+    private List<String> readHeader(MultipartFile file) throws IOException {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(file.getInputStream()))) {
+            String line = reader.readLine();
+            if (line == null) throw new IOException("Empty file: " + file.getOriginalFilename());
+            return Arrays.asList(CSV_SPLIT_PATTERN.split(line, -1));
+        }
+    }
+
+    private Map<CompositeKey, String[]> readCsvFile(File file, int totalColumns) throws IOException {
+        Map<CompositeKey, String[]> records = new HashMap<>(5_000_000); 
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+            reader.readLine(); // Skip header
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String[] columns = CSV_SPLIT_PATTERN.split(line, -1);
+                if (columns.length < 2) continue;
+                String[] adjustedColumns = Arrays.copyOf(columns, totalColumns);
+                CompositeKey key = new CompositeKey(adjustedColumns[0], adjustedColumns[1]);
+                String[] valueColumns = new String[totalColumns - 2];
+                System.arraycopy(adjustedColumns, 2, valueColumns, 0, totalColumns - 2);
+                records.put(key, valueColumns);
+            }
+        }
+        return records;
+    }
+
+    private Map<CompositeKey, String[]> readCsvFile(MultipartFile file, int totalColumns) throws IOException {
+        Map<CompositeKey, String[]> records = new HashMap<>(5_000_000);
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(file.getInputStream()))) {
+            reader.readLine(); // Skip header
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String[] columns = CSV_SPLIT_PATTERN.split(line, -1);
+                if (columns.length < 2) continue;
+                String[] adjustedColumns = Arrays.copyOf(columns, totalColumns);
+                CompositeKey key = new CompositeKey(adjustedColumns[0], adjustedColumns[1]);
+                String[] valueColumns = new String[totalColumns - 2];
+                System.arraycopy(adjustedColumns, 2, valueColumns, 0, totalColumns - 2);
+                records.put(key, valueColumns);
+            }
+        }
+        return records;
+    }
+
+    private double getThresholdForColumn(int columnIndex, String columnName) {
+        if (columnName.equalsIgnoreCase("price")) return 2.0;
+        if (columnName.equalsIgnoreCase("quantity")) return 10.0;
+        return DEFAULT_THRESHOLD;
+    }
+
+    private String truncate(String value, int maxLength) {
+        if (value == null) return "null";
+        return value.length() > maxLength ? value.substring(0, maxLength) + "..." : value;
+    }
+
+    static class CompositeKey {
+        private final String column1;
+        private final String column2;
+
+        public CompositeKey(String column1, String column2) {
+            this.column1 = column1;
+            this.column2 = column2;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            CompositeKey that = (CompositeKey) o;
+            return Objects.equals(column1, that.column1) && 
+                   Objects.equals(column2, that.column2);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(column1, column2);
+        }
+    }
+
+    static class ColumnStats {
+        int mismatchCount = 0;
+        double threshold = DEFAULT_THRESHOLD;
+        List<ValuePair<String, String>> examples = new ArrayList<>(5);
+    }
+
+    static class ValuePair<O, N> {
+        private final O oldValue;
+        private final N newValue;
+
+        public ValuePair(O oldValue, N newValue) {
+            this.oldValue = oldValue;
+            this.newValue = newValue;
+        }
+
+        public O getOldValue() { return oldValue; }
+        public N getNewValue() { return newValue; }
+    }
+}
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CSV Comparison Tool</title>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input[type="file"] { padding: 8px; border: 1px solid #ddd; border-radius: 4px; width: 100%; }
+        button { background-color: #4CAF50; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+        button:hover { background-color: #45a049; }
+        button:disabled { background-color: #cccccc; }
+        #results { margin-top: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 4px; background-color: #f9f9f9; }
+        .violation { color: #d32f2f; margin: 10px 0; padding: 10px; background-color: #ffebee; border-radius: 4px; }
+        .success { color: #388e3c; margin: 10px 0; padding: 10px; background-color: #e8f5e9; border-radius: 4px; }
+        .loading { display: none; margin: 10px 0; color: #1976d2; }
+        #error { color: #d32f2f; margin: 10px 0; display: none; }
+        table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #f2f2f2; }
+        .status-pass { color: #388e3c; }
+        .status-fail { color: #d32f2f; }
+    </style>
+</head>
+<body>
+    <h1>CSV Comparison Tool</h1>
+    <p>Upload new CSV file to compare against reference file</p>
+    
+    <form id="csvForm">
+        <div class="form-group">
+            <label for="newFile">New CSV File:</label>
+            <input type="file" id="newFile" name="newFile" accept=".csv" required>
+        </div>
+        
+        <button type="submit" id="submitBtn">Compare with Reference File</button>
+        <div id="loading" class="loading">Processing files, please wait...</div>
+        <div id="error"></div>
+    </form>
+    
+    <div id="results"></div>
+    
+    <script>
+        $(document).ready(function() {
+            $('#csvForm').on('submit', function(e) {
+                e.preventDefault();
+                
+                // Clear previous messages
+                $('#error').hide().empty();
+                $('#results').empty();
+                
+                // Validate file
+                var fileInput = $('#newFile')[0];
+                if (fileInput.files.length === 0) {
+                    showError('Please select a file');
+                    return;
+                }
+                
+                // Disable button during processing
+                $('#submitBtn').prop('disabled', true);
+                $('#loading').show();
+                
+                // Prepare form data
+                var formData = new FormData();
+                formData.append('newFile', fileInput.files[0]);
+                
+                // Submit request
+                $.ajax({
+                    url: '/api/csv/compare',
+                    type: 'POST',
+                    data: formData,
+                    contentType: false,
+                    processData: false,
+                    success: function(response) {
+                        displayResults(response);
+                    },
+                    error: function(xhr) {
+                        var error = xhr.responseJSON ? xhr.responseJSON.error : 
+                                  xhr.statusText ? xhr.statusText : 'An error occurred';
+                        showError(error);
+                    },
+                    complete: function() {
+                        $('#submitBtn').prop('disabled', false);
+                        $('#loading').hide();
+                    }
+                });
+            });
+            
+            function showError(message) {
+                $('#error').text(message).show();
+            }
+            
+            function displayResults(data) {
+                var resultsDiv = $('#results');
+                
+                if (data.error) {
+                    showError(data.error);
+                    return;
+                }
+                
+                // Basic info
+                var html = '<h3>Comparison Results</h3>' +
+                          '<p>Total records compared: ' + data.total_records_compared + '</p>' +
+                          '<p>Processing time: ' + data.processing_time_ms + ' ms</p>';
+                
+                // Overall status
+                if (data.has_violations) {
+                    html += '<div class="violation">' + data.message + '</div>';
+                } else {
+                    html += '<div class="success">' + data.message + '</div>';
+                    if (data.saved_path) {
+                        html += '<p>File saved to: ' + data.saved_path + '</p>';
+                    }
+                }
+                
+                // Column statistics table
+                html += '<h4>Column Statistics</h4><table>' +
+                       '<tr><th>Column</th><th>Changed</th><th>Change %</th>' +
+                       '<th>Threshold</th><th>Status</th></tr>';
+                
+                $.each(data.columns, function(index, column) {
+                    var statusClass = column.violation ? 'status-fail' : 'status-pass';
+                    var statusText = column.violation ? 'FAIL' : 'PASS';
+                    
+                    html += '<tr>' +
+                           '<td>' + column.column + '</td>' +
+                           '<td>' + column.changed_records + '</td>' +
+                           '<td>' + column.change_percent.toFixed(2) + '%</td>' +
+                           '<td>' + column.threshold + '%</td>' +
+                           '<td class="' + statusClass + '">' + statusText + '</td>' +
+                           '</tr>';
+                });
+                html += '</table>';
+                
+                // Violation details
+                if (data.has_violations && data.violations) {
+                    html += '<h4>Violation Details</h4>';
+                    $.each(data.violations, function(index, violation) {
+                        html += '<div class="violation">' +
+                               '<p><strong>' + violation.column + '</strong>: ' +
+                               violation.change_percent.toFixed(2) + '% changed (threshold: ' +
+                               violation.threshold + '%)</p>' +
+                               '<p>Example changes:</p><ul>';
+                        
+                        $.each(violation.examples, function(i, example) {
+                            html += '<li>' + example.old_value + ' → ' + example.new_value + '</li>';
+                        });
+                        
+                        html += '</ul></div>';
+                    });
+                }
+                
+                resultsDiv.html(html);
+            }
+        });
+    </script>
+</body>
+</html>
